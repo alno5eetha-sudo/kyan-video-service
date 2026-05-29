@@ -109,11 +109,31 @@ async function renderVideoFromHtml({ html, duration = 6, width = 1080, height = 
   }
 }
 
+// Capture a single PNG frame (fast preview / debug — no video encoding)
+async function renderScreenshotFromHtml({ html, width = 1080, height = 1920, delay = 4500 }) {
+  const id = uuidv4();
+  const outputPath = path.join(OUTPUT_DIR, `${id}.png`);
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  try {
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 60000 });
+    await page.evaluate(async () => {
+      if (document.fonts && document.fonts.ready) await document.fonts.ready;
+    });
+    await new Promise(r => setTimeout(r, delay));
+    await page.screenshot({ path: outputPath, type: 'png' });
+    return { url: `${PUBLIC_URL}/videos/${id}.png`, id, width, height };
+  } finally {
+    await page.close();
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // API ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template'] });
+  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template', '/screenshot', '/screenshot-template'] });
 });
 
 app.get('/health', (req, res) => {
@@ -170,6 +190,40 @@ app.post('/render-template', async (req, res) => {
     res.json({ ...result, template });
   } catch(e) {
     console.error('Render template error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Fast PNG preview of arbitrary HTML (debug / design review)
+app.post('/screenshot', async (req, res) => {
+  try {
+    const { html, width, height, delay } = req.body;
+    if (!html || typeof html !== 'string') return res.status(400).json({ error: 'missing html' });
+    const result = await renderScreenshotFromHtml({ html, width, height, delay });
+    res.json(result);
+  } catch(e) {
+    console.error('Screenshot error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Fast PNG preview of a named template (debug / design review)
+app.post('/screenshot-template', async (req, res) => {
+  try {
+    const { template, data = {} } = req.body;
+    if (!template) return res.status(400).json({ error: 'missing template' });
+    const tmpl = TEMPLATES[template];
+    if (!tmpl) return res.status(404).json({ error: 'template not found', available: Object.keys(TEMPLATES) });
+    const html = tmpl.render(data);
+    const result = await renderScreenshotFromHtml({
+      html,
+      width: tmpl.size.width,
+      height: tmpl.size.height,
+      delay: data.delay || 4500
+    });
+    res.json({ ...result, template });
+  } catch(e) {
+    console.error('Screenshot template error:', e);
     res.status(500).json({ error: e.message });
   }
 });
