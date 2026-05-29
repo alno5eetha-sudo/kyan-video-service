@@ -129,11 +129,37 @@ async function renderScreenshotFromHtml({ html, width = 1080, height = 1920, del
   }
 }
 
+// Render an HTML document to a print-ready PDF (honours CSS @page size)
+async function renderPdfFromHtml({ html, landscape = false }) {
+  const id = uuidv4();
+  const outputPath = path.join(OUTPUT_DIR, `${id}.pdf`);
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  try {
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 60000 });
+    await page.evaluate(async () => {
+      if (document.fonts && document.fonts.ready) await document.fonts.ready;
+    });
+    await new Promise(r => setTimeout(r, 1200)); // let webfonts paint
+    await page.pdf({
+      path: outputPath,
+      printBackground: true,
+      preferCSSPageSize: true,
+      format: 'A4',
+      landscape,
+      margin: { top: '0', right: '0', bottom: '0', left: '0' }
+    });
+    return { url: `${PUBLIC_URL}/videos/${id}.pdf`, id };
+  } finally {
+    await page.close();
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // API ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template', '/screenshot', '/screenshot-template'] });
+  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template', '/screenshot', '/screenshot-template', '/pdf'] });
 });
 
 app.get('/health', (req, res) => {
@@ -190,6 +216,20 @@ app.post('/render-template', async (req, res) => {
     res.json({ ...result, template });
   } catch(e) {
     console.error('Render template error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// HTML document → print-ready PDF (A4, honours CSS @page)
+app.post('/pdf', async (req, res) => {
+  try {
+    const { html, landscape } = req.body;
+    if (!html || typeof html !== 'string') return res.status(400).json({ error: 'missing html' });
+    if (html.length > 10_000_000) return res.status(400).json({ error: 'html too large' });
+    const result = await renderPdfFromHtml({ html, landscape: !!landscape });
+    res.json(result);
+  } catch(e) {
+    console.error('PDF error:', e);
     res.status(500).json({ error: e.message });
   }
 });
