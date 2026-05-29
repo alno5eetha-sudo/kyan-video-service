@@ -1,0 +1,19 @@
+{
+  "name": "kyan-video-render",
+  "version": "1.0.0",
+  "description": "Animated HTML to MP4 / GIF renderer for KYAN",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "puppeteer": "^22.0.0",
+    "puppeteer-screen-recorder": "^3.0.6",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
