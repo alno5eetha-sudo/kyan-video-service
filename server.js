@@ -81,16 +81,16 @@ async function renderVideoFromHtml({ html, duration = 6, width = 1080, height = 
     await page.evaluate(async () => {
       if (document.fonts && document.fonts.ready) await document.fonts.ready;
     });
-    await new Promise(r => setTimeout(r, 1500)); // settle animations start
+    await new Promise(r => setTimeout(r, 500)); // brief paint buffer (fonts already awaited)
 
     const recorder = new PuppeteerScreenRecorder(page, {
       followNewTab: false,
       fps,
       videoFrame: { width, height },
-      videoCrf: 18,
+      videoCrf: 16,            // higher quality (less banding on gradients)
       videoCodec: 'libx264',
-      videoPreset: 'fast',
-      videoBitrate: 4000,
+      videoPreset: 'medium',   // better compression quality
+      videoBitrate: 12000,     // 3x bitrate -> rich, un-washed color
       autopad: { color: 'black' },
       aspectRatio: `${width}:${height}`
     });
