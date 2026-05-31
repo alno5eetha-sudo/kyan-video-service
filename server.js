@@ -383,6 +383,18 @@ app.post('/slideshow', async (req, res) => {
   }
 });
 
+// Store a base64 image (e.g. an AI illustration) and return a hosted URL — used so slide re-render keeps the same illustration
+app.post('/upload', (req, res) => {
+  try {
+    const { data, ext } = req.body;
+    if (!data || typeof data !== 'string') return res.status(400).json({ error: 'missing data' });
+    const e = (ext || 'png').replace(/[^a-z0-9]/gi, '').slice(0, 4) || 'png';
+    const id = uuidv4();
+    fs.writeFileSync(path.join(OUTPUT_DIR, id + '.' + e), Buffer.from(data, 'base64'));
+    res.json({ url: `${PUBLIC_URL}/videos/${id}.${e}`, id });
+  } catch(e) { console.error('Upload error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e.message));
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && e.message));
 
