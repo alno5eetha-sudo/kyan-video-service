@@ -5,6 +5,8 @@ const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const { spawn } = require('child_process');
 // Lazy-loaded heavy deps (so server starts even if a dep has issues)
 let puppeteer = null;
 let PuppeteerScreenRecorder = null;
@@ -156,10 +158,109 @@ async function renderPdfFromHtml({ html, landscape = false }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// SLIDESHOW: carousel images (+ music) → MP4 with crossfades (FFmpeg)
+// ─────────────────────────────────────────────────────────────────────
+async function downloadTo(url, dest) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('fetch ' + r.status + ' ' + url);
+  fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+  return dest;
+}
+
+function runFfmpeg(args, timeoutMs = 150000) {
+  return new Promise((resolve, reject) => {
+    const p = spawn('ffmpeg', args);
+    let err = '';
+    p.stderr.on('data', d => { err += d.toString(); if (err.length > 24000) err = err.slice(-24000); });
+    const to = setTimeout(() => { try { p.kill('SIGKILL'); } catch(e){} reject(new Error('ffmpeg timeout')); }, timeoutMs);
+    p.on('close', code => { clearTimeout(to); code === 0 ? resolve() : reject(new Error('ffmpeg exit ' + code + ': ' + err.slice(-900))); });
+    p.on('error', e => { clearTimeout(to); reject(e); });
+  });
+}
+
+// images: array of URLs · audio: optional URL (else original synthesized ambient pad)
+async function renderSlideshow({ images, audio, perSlide = 3.2, fade = 0.7, width = 1080, height = 1350, bg = '0xF4EEE1' }) {
+  if (!Array.isArray(images) || !images.length) throw new Error('no images');
+  const id = uuidv4();
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'slide-'));
+  const outputPath = path.join(OUTPUT_DIR, `${id}.mp4`);
+  try {
+    const localImgs = [];
+    for (let i = 0; i < images.length; i++) {
+      const m = (images[i].split('?')[0].match(/\.(png|jpe?g|webp)$/i) || [null, 'png']);
+      const ext = (m[1] || 'png').toLowerCase().replace('jpeg', 'jpg');
+      const dest = path.join(work, `img${i}.${ext}`);
+      await downloadTo(images[i], dest);
+      localImgs.push(dest);
+    }
+    const N = localImgs.length;
+    const D = Math.max(1.5, +perSlide || 3.2);
+    const T = N > 1 ? Math.min(+fade || 0.7, D - 0.3) : 0;
+    const total = +(N * D - (N - 1) * T).toFixed(3);
+
+    const args = ['-y'];
+    localImgs.forEach(f => { args.push('-loop', '1', '-t', String(D), '-i', f); });
+
+    // audio source
+    let synth = true;
+    const PAD = [130.81, 261.63, 329.63, 392.00, 587.33]; // C3 + Cmaj9 voicing — calm, modern
+    if (audio) {
+      const am = (audio.split('?')[0].match(/\.(mp3|m4a|aac|wav|ogg)$/i) || [null, 'mp3']);
+      const aext = (am[1] || 'mp3').toLowerCase();
+      const aLocal = path.join(work, `music.${aext}`);
+      await downloadTo(audio, aLocal);
+      args.push('-stream_loop', '-1', '-i', aLocal);
+      synth = false;
+    } else {
+      PAD.forEach(fq => args.push('-f', 'lavfi', '-i', `sine=frequency=${fq}:sample_rate=44100`));
+    }
+
+    // video filter: scale/pad each, then xfade chain
+    let fc = '';
+    localImgs.forEach((f, i) => {
+      fc += `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${bg},setsar=1,fps=30,format=yuv420p[v${i}];`;
+    });
+    if (N === 1) {
+      fc += `[v0]copy[vout];`;
+    } else {
+      let prev = 'v0';
+      for (let k = 1; k < N; k++) {
+        const off = (k * (D - T)).toFixed(3);
+        const out = (k === N - 1) ? 'vout' : `x${k}`;
+        fc += `[${prev}][v${k}]xfade=transition=fade:duration=${T}:offset=${off}[${out}];`;
+        prev = out;
+      }
+    }
+
+    // audio filter
+    const aStart = N;
+    if (synth) {
+      const labels = PAD.map((_, j) => `[${aStart + j}:a]`).join('');
+      fc += `${labels}amix=inputs=${PAD.length}:duration=longest:weights=0.6 1 0.85 0.8 0.5,aformat=channel_layouts=stereo,tremolo=f=0.12:d=0.5,aecho=0.85:0.9:55:0.35,lowpass=f=2200,volume=3.2,afade=t=in:d=1.6,afade=t=out:st=${Math.max(0, total - 2).toFixed(3)}:d=2[aout]`;
+    } else {
+      fc += `[${aStart}:a]aformat=channel_layouts=stereo,volume=0.85,afade=t=in:d=1.2,afade=t=out:st=${Math.max(0, total - 1.8).toFixed(3)}:d=1.8[aout]`;
+    }
+
+    args.push(
+      '-filter_complex', fc,
+      '-map', '[vout]', '-map', '[aout]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '30', '-crf', '18', '-preset', 'veryfast',
+      '-c:a', 'aac', '-b:a', '160k', '-ar', '44100',
+      '-t', String(total), '-movflags', '+faststart',
+      outputPath
+    );
+    await runFfmpeg(args);
+    return { url: `${PUBLIC_URL}/videos/${id}.mp4`, id, duration: total, width, height, slides: N, music: synth ? 'synth-ambient' : 'custom' };
+  } finally {
+    try { fs.rmSync(work, { recursive: true, force: true }); } catch(e){}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // API ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template', '/screenshot', '/screenshot-template', '/pdf'] });
+  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template', '/screenshot', '/screenshot-template', '/pdf', '/slideshow'] });
 });
 
 app.get('/health', (req, res) => {
@@ -264,6 +365,20 @@ app.post('/screenshot-template', async (req, res) => {
     res.json({ ...result, template });
   } catch(e) {
     console.error('Screenshot template error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Carousel images (+ optional music URL) → MP4 slideshow with crossfades + ambient music
+app.post('/slideshow', async (req, res) => {
+  try {
+    const { images, audio, perSlide, fade, width, height, bg } = req.body;
+    if (!Array.isArray(images) || !images.length) return res.status(400).json({ error: 'missing images[]' });
+    if (images.length > 12) return res.status(400).json({ error: 'too many images (max 12)' });
+    const result = await renderSlideshow({ images, audio, perSlide, fade, width, height, bg });
+    res.json(result);
+  } catch(e) {
+    console.error('Slideshow error:', e);
     res.status(500).json({ error: e.message });
   }
 });
