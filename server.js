@@ -39,6 +39,7 @@ setInterval(() => {
     const files = fs.readdirSync(OUTPUT_DIR);
     const cutoff = Date.now() - RETENTION_HOURS * 3600 * 1000;
     files.forEach(f => {
+      if (f.indexOf('lm_') === 0) return; // lead-magnet files are permanent (never auto-deleted)
       const fp = path.join(OUTPUT_DIR, f);
       const st = fs.statSync(fp);
       if (st.mtimeMs < cutoff) {
@@ -112,8 +113,8 @@ async function renderVideoFromHtml({ html, duration = 6, width = 1080, height = 
 }
 
 // Capture a single PNG frame (fast preview / debug — no video encoding)
-async function renderScreenshotFromHtml({ html, width = 1080, height = 1920, delay = 4500 }) {
-  const id = uuidv4();
+async function renderScreenshotFromHtml({ html, width = 1080, height = 1920, delay = 4500, keep = false }) {
+  const id = (keep ? 'lm_' : '') + uuidv4();
   const outputPath = path.join(OUTPUT_DIR, `${id}.png`);
   const browser = await getBrowser();
   const page = await browser.newPage();
@@ -132,8 +133,8 @@ async function renderScreenshotFromHtml({ html, width = 1080, height = 1920, del
 }
 
 // Render an HTML document to a print-ready PDF (honours CSS @page size)
-async function renderPdfFromHtml({ html, landscape = false }) {
-  const id = uuidv4();
+async function renderPdfFromHtml({ html, landscape = false, keep = false }) {
+  const id = (keep ? 'lm_' : '') + uuidv4();
   const outputPath = path.join(OUTPUT_DIR, `${id}.pdf`);
   const browser = await getBrowser();
   const page = await browser.newPage();
@@ -324,10 +325,10 @@ app.post('/render-template', async (req, res) => {
 // HTML document → print-ready PDF (A4, honours CSS @page)
 app.post('/pdf', async (req, res) => {
   try {
-    const { html, landscape } = req.body;
+    const { html, landscape, keep } = req.body;
     if (!html || typeof html !== 'string') return res.status(400).json({ error: 'missing html' });
     if (html.length > 10_000_000) return res.status(400).json({ error: 'html too large' });
-    const result = await renderPdfFromHtml({ html, landscape: !!landscape });
+    const result = await renderPdfFromHtml({ html, landscape: !!landscape, keep: !!keep });
     res.json(result);
   } catch(e) {
     console.error('PDF error:', e);
@@ -338,9 +339,9 @@ app.post('/pdf', async (req, res) => {
 // Fast PNG preview of arbitrary HTML (debug / design review)
 app.post('/screenshot', async (req, res) => {
   try {
-    const { html, width, height, delay } = req.body;
+    const { html, width, height, delay, keep } = req.body;
     if (!html || typeof html !== 'string') return res.status(400).json({ error: 'missing html' });
-    const result = await renderScreenshotFromHtml({ html, width, height, delay });
+    const result = await renderScreenshotFromHtml({ html, width, height, delay, keep: !!keep });
     res.json(result);
   } catch(e) {
     console.error('Screenshot error:', e);
