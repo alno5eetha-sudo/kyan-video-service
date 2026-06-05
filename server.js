@@ -258,10 +258,151 @@ async function renderSlideshow({ images, audio, perSlide = 3.2, fade = 0.7, widt
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// FILM ASSEMBLE: AI scene clips + Arabic captions + brand outro → one MP4
+// (captions rendered as transparent PNGs via Puppeteer → sidesteps Arabic
+//  shaping issues in FFmpeg drawtext; brand outro card; music or synth pad)
+// ─────────────────────────────────────────────────────────────────────
+function _esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function dimsFor(aspect){
+  if (aspect === '16:9') return { W:1920, H:1080 };
+  if (aspect === '1:1')  return { W:1080, H:1080 };
+  return { W:1080, H:1920 }; // 9:16 default
+}
+
+// Lower-third Arabic caption over a transparent frame
+function captionHtml({ text, W, H, accent }){
+  const fontSize = Math.max(30, Math.min(Math.round(W * 0.052), 64));
+  const bar = Math.max(6, Math.round(W * 0.012));
+  return `<!doctype html><html dir="rtl"><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap" rel="stylesheet">
+<style>*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:${W}px;height:${H}px;overflow:hidden;background:transparent;font-family:'Cairo',sans-serif}
+.scrim{position:absolute;left:0;right:0;bottom:0;height:44%;background:linear-gradient(to top,rgba(0,0,0,.74) 0%,rgba(0,0,0,.42) 48%,rgba(0,0,0,0) 100%)}
+.cap{position:absolute;left:6%;right:6%;bottom:${Math.round(H*0.085)}px;display:flex;align-items:center;gap:${Math.round(W*0.026)}px;direction:rtl}
+.bar{flex:0 0 auto;width:${bar}px;align-self:stretch;min-height:${Math.round(fontSize*1.25)}px;background:${accent};border-radius:99px;box-shadow:0 0 26px ${accent}bb}
+.txt{font-weight:900;font-size:${fontSize}px;line-height:1.32;color:#fff;text-shadow:0 3px 20px rgba(0,0,0,.9);letter-spacing:-1px}</style></head>
+<body><div class="scrim"></div><div class="cap"><span class="bar"></span><span class="txt">${_esc(text)}</span></div></body></html>`;
+}
+
+// Branded end card (logo + CTA + handle)
+function outroHtml({ W, H, brandKit, cta, handle, logo, title }){
+  const bg = brandKit.bg || brandKit.a2 || '#0B0B0D';
+  const accent = brandKit.a1 || '#E8B04B';
+  const isImg = typeof logo === 'string' && /^https?:\/\//.test(logo);
+  const logoText = (logo && !isImg) ? logo : (brandKit.logo || title || '');
+  const logoBlock = isImg
+    ? `<img class="logo-img" src="${_esc(logo)}">`
+    : `<div class="logo-txt">${_esc(logoText)}</div>`;
+  const ctaBlock = cta ? `<div class="cta">${_esc(cta)}</div>` : '';
+  const handleBlock = handle ? `<div class="handle">${_esc(handle)}</div>` : '';
+  return `<!doctype html><html dir="rtl"><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&family=Inter:wght@700;800&display=swap" rel="stylesheet">
+<style>*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:${W}px;height:${H}px;overflow:hidden;background:${bg};font-family:'Cairo',sans-serif;display:flex;align-items:center;justify-content:center}
+.glow{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:${Math.round(W*0.9)}px;height:${Math.round(W*0.9)}px;background:radial-gradient(circle,${accent}26 0%,transparent 62%);pointer-events:none}
+.wrap{position:relative;z-index:2;text-align:center;padding:8%;max-width:90%}
+.logo-img{max-width:${Math.round(W*0.52)}px;max-height:${Math.round(H*0.20)}px;object-fit:contain;display:block;margin:0 auto ${Math.round(H*0.035)}px}
+.logo-txt{font-weight:900;font-size:${Math.round(W*0.13)}px;line-height:1;color:#fff;letter-spacing:-3px;margin-bottom:${Math.round(H*0.03)}px}
+.accent-line{width:${Math.round(W*0.16)}px;height:6px;background:${accent};border-radius:99px;margin:0 auto ${Math.round(H*0.04)}px}
+.cta{font-weight:900;font-size:${Math.round(W*0.07)}px;line-height:1.34;color:#fff;margin-bottom:${Math.round(H*0.05)}px}
+.handle{font-family:'Inter',sans-serif;font-weight:800;font-size:${Math.round(W*0.03)}px;letter-spacing:3px;color:${accent};direction:ltr}</style></head>
+<body><div class="glow"></div><div class="wrap">${logoBlock}<div class="accent-line"></div>${ctaBlock}${handleBlock}</div></body></html>`;
+}
+
+// Render HTML → PNG file in tmp (transparent optional). Returns local path.
+async function pngFromHtml({ html, W, H, transparent, dir }){
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  try {
+    await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 60000 });
+    await page.evaluate(async () => { if (document.fonts && document.fonts.ready) await document.fonts.ready; });
+    await new Promise(r => setTimeout(r, 450));
+    const p = path.join(dir, uuidv4() + '.png');
+    await page.screenshot({ path: p, type: 'png', omitBackground: !!transparent });
+    return p;
+  } finally { await page.close(); }
+}
+
+async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspect = '9:16', music = '', title = '', logo = '' }){
+  const { W, H } = dimsFor(aspect);
+  const accent = brandKit.a1 || '#E8B04B';
+  const id = uuidv4();
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'film-'));
+  const outputPath = path.join(OUTPUT_DIR, `${id}.mp4`);
+  try {
+    const segs = [];
+    let total = 0;
+    // 1) per-scene: download clip → normalize to W×H → overlay Arabic caption → seg
+    for (let i = 0; i < scenes.length; i++){
+      const sc = scenes[i] || {};
+      const dur = Math.min(Math.max(+sc.duration || 5, 2), 10);
+      const clipLocal = path.join(work, `clip${i}.mp4`);
+      await downloadTo(sc.clip, clipLocal);
+      const seg = path.join(work, `seg${i}.mp4`);
+      const args = ['-y', '-i', clipLocal];
+      let fc;
+      if ((sc.onscreen || '').trim()){
+        const capPng = await pngFromHtml({ html: captionHtml({ text: sc.onscreen, W, H, accent }), W, H, transparent: true, dir: work });
+        args.push('-i', capPng);
+        fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30[b];[b][1:v]overlay=0:0,format=yuv420p[v]`;
+      } else {
+        fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30,format=yuv420p[v]`;
+      }
+      args.push('-filter_complex', fc, '-map', '[v]', '-an', '-t', String(dur),
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '30', '-crf', '18', '-preset', 'veryfast', seg);
+      await runFfmpeg(args, 120000);
+      segs.push(seg); total += dur;
+    }
+    // 2) branded outro card
+    const outroDur = 2.6;
+    const outroPng = await pngFromHtml({ html: outroHtml({ W, H, brandKit, cta, handle, logo, title }), W, H, transparent: false, dir: work });
+    const outroSeg = path.join(work, 'outro.mp4');
+    await runFfmpeg(['-y', '-loop', '1', '-t', String(outroDur), '-i', outroPng,
+      '-filter_complex', `[0:v]scale=${W}:${H},setsar=1,fps=30,format=yuv420p,fade=t=in:d=0.5[v]`,
+      '-map', '[v]', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '30', '-crf', '18', '-preset', 'veryfast', outroSeg], 60000);
+    segs.push(outroSeg); total = +(total + outroDur).toFixed(2);
+
+    // 3) concat (demuxer) + audio (provided music or synth ambient pad) + master fades
+    const listFile = path.join(work, 'list.txt');
+    fs.writeFileSync(listFile, segs.map(s => `file '${s.replace(/'/g, "'\\''")}'`).join('\n'));
+
+    const fargs = ['-y', '-f', 'concat', '-safe', '0', '-i', listFile];
+    const PAD = [130.81, 261.63, 329.63, 392.00, 587.33]; // C3 + Cmaj9 — calm cinematic pad
+    let synth = true;
+    if (music && /^https?:/.test(music)){
+      const am = (music.split('?')[0].match(/\.(mp3|m4a|aac|wav|ogg)$/i) || [null, 'mp3']);
+      const aLocal = path.join(work, `music.${(am[1] || 'mp3').toLowerCase()}`);
+      await downloadTo(music, aLocal);
+      fargs.push('-stream_loop', '-1', '-i', aLocal); synth = false;
+    } else {
+      PAD.forEach(fq => fargs.push('-f', 'lavfi', '-i', `sine=frequency=${fq}:sample_rate=44100`));
+    }
+    let fc2 = `[0:v]fade=t=in:d=0.4,fade=t=out:st=${Math.max(0, total - 0.5).toFixed(2)}:d=0.5[v];`;
+    if (synth){
+      const labels = PAD.map((_, j) => `[${1 + j}:a]`).join('');
+      fc2 += `${labels}amix=inputs=${PAD.length}:duration=longest:weights=0.6 1 0.85 0.8 0.5,aformat=channel_layouts=stereo,tremolo=f=0.12:d=0.5,aecho=0.85:0.9:55:0.35,lowpass=f=2200,volume=3.0,afade=t=in:d=1.4,afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2[aout]`;
+    } else {
+      fc2 += `[1:a]aformat=channel_layouts=stereo,volume=0.9,afade=t=in:d=1.2,afade=t=out:st=${Math.max(0, total - 1.8).toFixed(2)}:d=1.8[aout]`;
+    }
+    fargs.push('-filter_complex', fc2, '-map', '[v]', '-map', '[aout]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '30', '-crf', '18', '-preset', 'veryfast',
+      '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-t', String(total), '-movflags', '+faststart', outputPath);
+    await runFfmpeg(fargs, 240000);
+
+    return { url: `${PUBLIC_URL}/videos/${id}.mp4`, id, duration: total, width: W, height: H, scenes: scenes.length, music: synth ? 'synth-ambient' : 'custom' };
+  } finally {
+    try { fs.rmSync(work, { recursive: true, force: true }); } catch(e){}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // API ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template', '/screenshot', '/screenshot-template', '/pdf', '/slideshow'] });
+  res.json({ service: 'KYAN Video Render', status: 'ok', endpoints: ['/health', '/templates', '/render', '/render-template', '/screenshot', '/screenshot-template', '/pdf', '/slideshow', '/film-assemble'] });
 });
 
 app.get('/health', (req, res) => {
@@ -380,6 +521,26 @@ app.post('/slideshow', async (req, res) => {
     res.json(result);
   } catch(e) {
     console.error('Slideshow error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Film assembly: AI scene clips (+ Arabic captions + brand outro + music) → one MP4
+app.post('/film-assemble', async (req, res) => {
+  try {
+    const { scenes, brandKit, cta, handle, aspect, music, title, logo } = req.body;
+    if (!Array.isArray(scenes) || !scenes.length) return res.status(400).json({ error: 'missing scenes[]' });
+    if (scenes.length > 8) return res.status(400).json({ error: 'too many scenes (max 8)' });
+    for (const s of scenes) {
+      if (!s || typeof s.clip !== 'string' || !/^https?:\/\//.test(s.clip)) return res.status(400).json({ error: 'each scene needs a clip URL' });
+    }
+    const result = await assembleFilm({
+      scenes, brandKit: brandKit || {}, cta: cta || '', handle: handle || '',
+      aspect: aspect || '9:16', music: music || '', title: title || '', logo: logo || ''
+    });
+    res.json(result);
+  } catch(e) {
+    console.error('Film assemble error:', e);
     res.status(500).json({ error: e.message });
   }
 });
