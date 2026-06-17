@@ -326,7 +326,7 @@ async function pngFromHtml({ html, W, H, transparent, dir }){
   } finally { await page.close(); }
 }
 
-async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspect = '9:16', music = '', title = '', logo = '' }){
+async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspect = '9:16', music = '', title = '', logo = '', voiceover = [] }){
   const { W, H } = dimsFor(aspect);
   const accent = brandKit.a1 || '#E8B04B';
   const id = uuidv4();
@@ -334,11 +334,13 @@ async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspe
   const outputPath = path.join(OUTPUT_DIR, `${id}.mp4`);
   try {
     const segs = [];
+    const starts = [];
     let total = 0;
     // 1) per-scene: download clip → normalize to W×H → overlay Arabic caption → seg
     for (let i = 0; i < scenes.length; i++){
       const sc = scenes[i] || {};
       const dur = Math.min(Math.max(+sc.duration || 5, 2), 10);
+      starts.push(total);
       const clipLocal = path.join(work, `clip${i}.mp4`);
       await downloadTo(sc.clip, clipLocal);
       const seg = path.join(work, `seg${i}.mp4`);
@@ -369,23 +371,46 @@ async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspe
     const listFile = path.join(work, 'list.txt');
     fs.writeFileSync(listFile, segs.map(s => `file '${s.replace(/'/g, "'\\''")}'`).join('\n'));
 
+    const hasVO = Array.isArray(voiceover) && voiceover.some(v => v && /^https?:/.test(v));
     const fargs = ['-y', '-f', 'concat', '-safe', '0', '-i', listFile];
     const PAD = [130.81, 261.63, 329.63, 392.00, 587.33]; // C3 + Cmaj9 — calm cinematic pad
-    let synth = true;
+    let synth = true, musicIdx = -1, nextIdx = 1; // [0] = concat video
     if (music && /^https?:/.test(music)){
       const am = (music.split('?')[0].match(/\.(mp3|m4a|aac|wav|ogg)$/i) || [null, 'mp3']);
       const aLocal = path.join(work, `music.${(am[1] || 'mp3').toLowerCase()}`);
       await downloadTo(music, aLocal);
-      fargs.push('-stream_loop', '-1', '-i', aLocal); synth = false;
+      fargs.push('-stream_loop', '-1', '-i', aLocal); musicIdx = nextIdx++; synth = false;
     } else {
       PAD.forEach(fq => fargs.push('-f', 'lavfi', '-i', `sine=frequency=${fq}:sample_rate=44100`));
+      nextIdx += PAD.length;
+    }
+    // per-scene voiceover inputs (mixed above a ducked bed)
+    const voMix = [];
+    if (hasVO){
+      for (let i = 0; i < scenes.length; i++){
+        const vu = voiceover[i];
+        if (vu && /^https?:/.test(vu)){
+          const am = (vu.split('?')[0].match(/\.(mp3|m4a|aac|wav|ogg)$/i) || [null, 'mp3']);
+          const vLocal = path.join(work, `vo${i}.${(am[1] || 'mp3').toLowerCase()}`);
+          try { await downloadTo(vu, vLocal); fargs.push('-i', vLocal); voMix.push({ idx: nextIdx++, startMs: Math.round((starts[i] || 0) * 1000) + 120 }); } catch(e){}
+        }
+      }
     }
     let fc2 = `[0:v]fade=t=in:d=0.4,fade=t=out:st=${Math.max(0, total - 0.5).toFixed(2)}:d=0.5[v];`;
+    const bedVol = hasVO ? (synth ? 1.0 : 0.30) : (synth ? 3.0 : 0.9);
     if (synth){
       const labels = PAD.map((_, j) => `[${1 + j}:a]`).join('');
-      fc2 += `${labels}amix=inputs=${PAD.length}:duration=longest:weights=0.6 1 0.85 0.8 0.5,aformat=channel_layouts=stereo,tremolo=f=0.12:d=0.5,aecho=0.85:0.9:55:0.35,lowpass=f=2200,volume=3.0,afade=t=in:d=1.4,afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2[aout]`;
+      fc2 += `${labels}amix=inputs=${PAD.length}:duration=longest:weights=0.6 1 0.85 0.8 0.5,aformat=channel_layouts=stereo,tremolo=f=0.12:d=0.5,aecho=0.85:0.9:55:0.35,lowpass=f=2200,volume=${bedVol},afade=t=in:d=1.4,afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2[bed];`;
     } else {
-      fc2 += `[1:a]aformat=channel_layouts=stereo,volume=0.9,afade=t=in:d=1.2,afade=t=out:st=${Math.max(0, total - 1.8).toFixed(2)}:d=1.8[aout]`;
+      fc2 += `[${musicIdx}:a]aformat=channel_layouts=stereo,volume=${bedVol},afade=t=in:d=1.2,afade=t=out:st=${Math.max(0, total - 1.8).toFixed(2)}:d=1.8[bed];`;
+    }
+    if (hasVO && voMix.length){
+      voMix.forEach((v, n) => { fc2 += `[${v.idx}:a]aformat=channel_layouts=stereo,adelay=${v.startMs}|${v.startMs},volume=2.0[vo${n}];`; });
+      const voL = voMix.map((_, n) => `[vo${n}]`).join('');
+      fc2 += `${voL}amix=inputs=${voMix.length}:duration=longest:dropout_transition=0,volume=${voMix.length}[voice];`;
+      fc2 += `[voice][bed]amix=inputs=2:duration=longest:weights=1 0.5,dropout_transition=0,volume=2.0,afade=t=in:d=0.3,afade=t=out:st=${Math.max(0, total - 1.5).toFixed(2)}:d=1.5[aout]`;
+    } else {
+      fc2 += `[bed]anull[aout]`;
     }
     fargs.push('-filter_complex', fc2, '-map', '[v]', '-map', '[aout]',
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '30', '-crf', '18', '-preset', 'veryfast',
@@ -528,7 +553,7 @@ app.post('/slideshow', async (req, res) => {
 // Film assembly: AI scene clips (+ Arabic captions + brand outro + music) → one MP4
 app.post('/film-assemble', async (req, res) => {
   try {
-    const { scenes, brandKit, cta, handle, aspect, music, title, logo } = req.body;
+    const { scenes, brandKit, cta, handle, aspect, music, title, logo, voiceover } = req.body;
     if (!Array.isArray(scenes) || !scenes.length) return res.status(400).json({ error: 'missing scenes[]' });
     if (scenes.length > 8) return res.status(400).json({ error: 'too many scenes (max 8)' });
     for (const s of scenes) {
@@ -536,7 +561,8 @@ app.post('/film-assemble', async (req, res) => {
     }
     const result = await assembleFilm({
       scenes, brandKit: brandKit || {}, cta: cta || '', handle: handle || '',
-      aspect: aspect || '9:16', music: music || '', title: title || '', logo: logo || ''
+      aspect: aspect || '9:16', music: music || '', title: title || '', logo: logo || '',
+      voiceover: Array.isArray(voiceover) ? voiceover : []
     });
     res.json(result);
   } catch(e) {
