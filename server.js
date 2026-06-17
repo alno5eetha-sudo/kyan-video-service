@@ -174,7 +174,7 @@ function runFfmpeg(args, timeoutMs = 150000) {
     let err = '';
     p.stderr.on('data', d => { err += d.toString(); if (err.length > 24000) err = err.slice(-24000); });
     const to = setTimeout(() => { try { p.kill('SIGKILL'); } catch(e){} reject(new Error('ffmpeg timeout')); }, timeoutMs);
-    p.on('close', code => { clearTimeout(to); code === 0 ? resolve() : reject(new Error('ffmpeg exit ' + code + ': ' + err.slice(-900))); });
+    p.on('close', code => { clearTimeout(to); code === 0 ? resolve() : reject(new Error('ffmpeg exit ' + code + ': ' + err.slice(-2600))); });
     p.on('error', e => { clearTimeout(to); reject(e); });
   });
 }
@@ -397,7 +397,7 @@ async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspe
       }
     }
     let fc2 = `[0:v]fade=t=in:d=0.4,fade=t=out:st=${Math.max(0, total - 0.5).toFixed(2)}:d=0.5[v];`;
-    const bedVol = hasVO ? (synth ? 1.0 : 0.30) : (synth ? 3.0 : 0.9);
+    const bedVol = hasVO ? (synth ? 0.5 : 0.25) : (synth ? 3.0 : 0.9);
     if (synth){
       const labels = PAD.map((_, j) => `[${1 + j}:a]`).join('');
       fc2 += `${labels}amix=inputs=${PAD.length}:duration=longest:weights=0.6 1 0.85 0.8 0.5,aformat=channel_layouts=stereo,tremolo=f=0.12:d=0.5,aecho=0.85:0.9:55:0.35,lowpass=f=2200,volume=${bedVol},afade=t=in:d=1.4,afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2[bed];`;
@@ -405,10 +405,11 @@ async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspe
       fc2 += `[${musicIdx}:a]aformat=channel_layouts=stereo,volume=${bedVol},afade=t=in:d=1.2,afade=t=out:st=${Math.max(0, total - 1.8).toFixed(2)}:d=1.8[bed];`;
     }
     if (hasVO && voMix.length){
-      voMix.forEach((v, n) => { fc2 += `[${v.idx}:a]aformat=channel_layouts=stereo,adelay=${v.startMs}|${v.startMs},volume=2.0[vo${n}];`; });
+      // mono VO → adelay with all=1 (channel-count safe); sum non-overlapping clips with normalize=0
+      voMix.forEach((v, n) => { fc2 += `[${v.idx}:a]adelay=${v.startMs}:all=1,volume=1.9[vo${n}];`; });
       const voL = voMix.map((_, n) => `[vo${n}]`).join('');
-      fc2 += `${voL}amix=inputs=${voMix.length}:duration=longest:dropout_transition=0,volume=${voMix.length}[voice];`;
-      fc2 += `[voice][bed]amix=inputs=2:duration=longest:weights=1 0.5,dropout_transition=0,volume=2.0,afade=t=in:d=0.3,afade=t=out:st=${Math.max(0, total - 1.5).toFixed(2)}:d=1.5[aout]`;
+      fc2 += `${voL}amix=inputs=${voMix.length}:duration=longest:normalize=0[voice];`;
+      fc2 += `[bed][voice]amix=inputs=2:duration=longest:normalize=0,aformat=channel_layouts=stereo,volume=1.0,afade=t=in:d=0.3,afade=t=out:st=${Math.max(0, total - 1.5).toFixed(2)}:d=1.5[aout]`;
     } else {
       fc2 += `[bed]anull[aout]`;
     }
