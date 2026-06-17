@@ -179,6 +179,19 @@ function runFfmpeg(args, timeoutMs = 150000) {
   });
 }
 
+// Probe media duration in seconds (0 if unknown).
+function probeDuration(file){
+  return new Promise(resolve => {
+    try {
+      const p = spawn('ffprobe', ['-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1', file]);
+      let out = '';
+      p.stdout.on('data', d => out += d.toString());
+      p.on('close', () => { const v = parseFloat((out||'').trim()); resolve(isFinite(v) && v > 0 ? v : 0); });
+      p.on('error', () => resolve(0));
+    } catch(e){ resolve(0); }
+  });
+}
+
 // images: array of URLs · audio: optional URL (else original synthesized ambient pad)
 async function renderSlideshow({ images, audio, perSlide = 3.2, fade = 0.7, width = 1080, height = 1350, bg = '0xF4EEE1' }) {
   if (!Array.isArray(images) || !images.length) throw new Error('no images');
@@ -336,24 +349,47 @@ async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspe
     const segs = [];
     const starts = [];
     let total = 0;
-    // 1) per-scene: download clip → normalize to W×H → overlay Arabic caption → seg
+
+    const hasVO = Array.isArray(voiceover) && voiceover.some(v => v && /^https?:/.test(v));
+    const LEAD = 0.35, TAIL = 0.65; // breathing room before/after each spoken line
+    // pre-download + probe each voiceover so the VOICE drives scene pacing (editor's cut)
+    const voFiles = [];
+    if (hasVO){
+      for (let i = 0; i < scenes.length; i++){
+        const vu = voiceover[i];
+        if (vu && /^https?:/.test(vu)){
+          const am = (vu.split('?')[0].match(/\.(mp3|m4a|aac|wav|ogg)$/i) || [null, 'mp3']);
+          const vLocal = path.join(work, `vo${i}.${(am[1] || 'mp3').toLowerCase()}`);
+          try { await downloadTo(vu, vLocal); voFiles[i] = { file: vLocal, dur: await probeDuration(vLocal) }; }
+          catch(e){ voFiles[i] = null; }
+        } else voFiles[i] = null;
+      }
+    }
+
+    // 1) per-scene: scene length follows its VO line; clip time-stretched (setpts) to fill smoothly
     for (let i = 0; i < scenes.length; i++){
       const sc = scenes[i] || {};
-      const dur = Math.min(Math.max(+sc.duration || 5, 2), 10);
+      const vd = (voFiles[i] && voFiles[i].dur) || 0;
+      const dur = vd > 0
+        ? Math.min(Math.max(vd + LEAD + TAIL, 3), 12)
+        : Math.min(Math.max(+sc.duration || 5, 2), 10);
       starts.push(total);
       const clipLocal = path.join(work, `clip${i}.mp4`);
       await downloadTo(sc.clip, clipLocal);
+      let clipDur = await probeDuration(clipLocal); if (!(clipDur > 0)) clipDur = 5;
+      const factor = Math.min(Math.max(dur / clipDur, 0.5), 2.2); // smooth speed-fit to scene length
       const seg = path.join(work, `seg${i}.mp4`);
       const args = ['-y', '-i', clipLocal];
+      const base = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,setpts=${factor.toFixed(4)}*PTS,fps=30`;
       let fc;
       if ((sc.onscreen || '').trim()){
         const capPng = await pngFromHtml({ html: captionHtml({ text: sc.onscreen, W, H, accent }), W, H, transparent: true, dir: work });
         args.push('-i', capPng);
-        fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30[b];[b][1:v]overlay=0:0,format=yuv420p[v]`;
+        fc = `${base}[b];[b][1:v]overlay=0:0,format=yuv420p[v]`;
       } else {
-        fc = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30,format=yuv420p[v]`;
+        fc = `${base},format=yuv420p[v]`;
       }
-      args.push('-filter_complex', fc, '-map', '[v]', '-an', '-t', String(dur),
+      args.push('-filter_complex', fc, '-map', '[v]', '-an', '-t', dur.toFixed(3),
         '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '30', '-crf', '18', '-preset', 'veryfast', seg);
       await runFfmpeg(args, 120000);
       segs.push(seg); total += dur;
@@ -371,7 +407,6 @@ async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspe
     const listFile = path.join(work, 'list.txt');
     fs.writeFileSync(listFile, segs.map(s => `file '${s.replace(/'/g, "'\\''")}'`).join('\n'));
 
-    const hasVO = Array.isArray(voiceover) && voiceover.some(v => v && /^https?:/.test(v));
     const fargs = ['-y', '-f', 'concat', '-safe', '0', '-i', listFile];
     const PAD = [130.81, 261.63, 329.63, 392.00, 587.33]; // C3 + Cmaj9 — calm cinematic pad
     let synth = true, musicIdx = -1, nextIdx = 1; // [0] = concat video
@@ -384,15 +419,13 @@ async function assembleFilm({ scenes, brandKit = {}, cta = '', handle = '', aspe
       PAD.forEach(fq => fargs.push('-f', 'lavfi', '-i', `sine=frequency=${fq}:sample_rate=44100`));
       nextIdx += PAD.length;
     }
-    // per-scene voiceover inputs (mixed above a ducked bed)
+    // per-scene voiceover inputs, placed sequentially (no overlap) above a ducked bed
     const voMix = [];
     if (hasVO){
       for (let i = 0; i < scenes.length; i++){
-        const vu = voiceover[i];
-        if (vu && /^https?:/.test(vu)){
-          const am = (vu.split('?')[0].match(/\.(mp3|m4a|aac|wav|ogg)$/i) || [null, 'mp3']);
-          const vLocal = path.join(work, `vo${i}.${(am[1] || 'mp3').toLowerCase()}`);
-          try { await downloadTo(vu, vLocal); fargs.push('-i', vLocal); voMix.push({ idx: nextIdx++, startMs: Math.round((starts[i] || 0) * 1000) + 120 }); } catch(e){}
+        if (voFiles[i] && voFiles[i].file){
+          fargs.push('-i', voFiles[i].file);
+          voMix.push({ idx: nextIdx++, startMs: Math.round(((starts[i] || 0) + LEAD) * 1000) });
         }
       }
     }
